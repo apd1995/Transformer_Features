@@ -88,6 +88,8 @@ def main():
     args = ap.parse_args()
 
     distributed = is_dist()
+    print(f"Distributed: {distributed}")
+    
     if distributed:
         dist.init_process_group(backend="nccl")
         local_rank = int(os.environ["LOCAL_RANK"])
