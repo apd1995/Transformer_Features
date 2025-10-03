@@ -68,13 +68,23 @@ def cifar10_loaders(bs=128, workers=0, distributed=False):
     train_tfm, test_tfm = build_transforms()
     train = datasets.CIFAR10(root="./data", train=True,  download=True, transform=train_tfm)
     test  = datasets.CIFAR10(root="./data", train=False, download=True, transform= test_tfm)
+    
+    if distributed and dist.is_initialized():
+        dist.barrier()  # ensure data present before non-rank0 proceeds
+        
     train_samp = DistributedSampler(train, shuffle=True) if distributed else None
-    test_samp  = DistributedSampler(test,  shuffle=False) if distributed else None
+    test_samp  = None
+
     train_loader = DataLoader(train, batch_size=bs, shuffle=(train_samp is None),
                               sampler=train_samp, num_workers=workers, pin_memory=True)
     test_loader  = DataLoader(test,  batch_size=bs, shuffle=False,
                               sampler=test_samp,  num_workers=workers, pin_memory=True)
     return train_loader, test_loader, train_samp, test_samp
+
+def ddp_allreduce_sum(t: torch.Tensor):
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return t
 
 @torch.no_grad()
 def eval_top1(model, loader, device):
@@ -135,17 +145,45 @@ def main():
     for ep in range(args.epochs):
         if distributed and train_samp is not None:
             train_samp.set_epoch(ep)
+    
         model.train()
+        train_correct = 0
+        train_total = 0
+        train_loss_sum = 0.0
+    
         for x, y in train_loader:
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             opt.zero_grad(set_to_none=True)
-            loss = loss_fn(model(x), y)
+            logits = model(x)
+            loss = loss_fn(logits, y)
             loss.backward(); opt.step()
-
-        # eval (rank 0 only for neat logs)
+    
+            # --- accumulate train metrics ---
+            with torch.no_grad():
+                pred = logits.argmax(1)
+                train_correct += (pred == y).sum().item()
+                n = y.numel()
+                train_total   += n
+                train_loss_sum += loss.item() * n  # sample-weighted
+    
+        # --- DDP aggregate ---
+        if distributed:
+            t = torch.tensor([train_correct, train_total, train_loss_sum],
+                             device=device, dtype=torch.float64)
+            ddp_allreduce_sum(t)
+            train_correct, train_total, train_loss_sum = t.tolist()
+    
+        train_acc = 100.0 * train_correct / max(1, train_total)
+        train_loss_avg = train_loss_sum / max(1, train_total)
+    
+        # eval (rank 0 only)
         if (not distributed) or dist.get_rank() == 0:
             top1 = eval_top1(model.module if distributed else model, test_loader, device)
-            print(f"Epoch {ep+1}/{args.epochs} | CIFAR-10 test top-1: {top1:.2f}%")
+            print(
+                f"Epoch {ep+1}/{args.epochs} | "
+                f"train acc: {train_acc:.2f}% | train loss: {train_loss_avg:.4f} | "
+                f"test acc: {top1:.2f}%"
+            )
 
     if distributed:
         dist.destroy_process_group()
