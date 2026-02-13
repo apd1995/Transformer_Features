@@ -51,11 +51,23 @@ class ViT(nn.Module):
         return self.head(x[:, 0])
 
 # ----- Data -----
-def cifar10_loaders(bs=128, workers=0, distributed=False):
+def build_transforms():
     mean, std = (0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)
-    tfm = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean, std)])
-    train = datasets.CIFAR10(root="./data", train=True,  download=True, transform=tfm)
-    test  = datasets.CIFAR10(root="./data", train=False, download=True, transform= tfm)
+    train_tfm = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.0),
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std),
+        transforms.RandomErasing(p=0.25, scale=(0.02, 0.2), ratio=(0.3, 3.3), inplace=True),
+    ])
+    test_tfm = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean, std)])
+    return train_tfm, test_tfm
+
+def cifar10_loaders(bs=128, workers=0, distributed=False):
+    train_tfm, test_tfm = build_transforms()
+    train = datasets.CIFAR10(root="./data", train=True,  download=True, transform=train_tfm)
+    test  = datasets.CIFAR10(root="./data", train=False, download=True, transform= test_tfm)
     train_samp = DistributedSampler(train, shuffle=True) if distributed else None
     test_samp  = DistributedSampler(test,  shuffle=False) if distributed else None
     train_loader = DataLoader(train, batch_size=bs, shuffle=(train_samp is None),
@@ -88,6 +100,8 @@ def main():
     args = ap.parse_args()
 
     distributed = is_dist()
+    print(f"Distributed: {distributed}")
+    
     if distributed:
         dist.init_process_group(backend="nccl")
         local_rank = int(os.environ["LOCAL_RANK"])
